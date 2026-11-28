@@ -26,8 +26,10 @@
  *
  * API:
  *   POST /tool/:name   — Call a tool. Body is JSON arguments. Returns formatted text.
- *   POST /reindex      — Opt-in index refresh. Body: { repo }. Returns status, repo,
- *                        duration_ms, indexedAt, lastCommit, staleness, and stats.
+ *   POST /reindex      — Opt-in index refresh. Requires an auth token, rejects browser
+ *                        (Origin) requests, and requires GITNEXUS_MCP_ENABLE_REFRESH=1.
+ *                        Body: { repo }. Returns status, repo, duration_ms, indexedAt,
+ *                        lastCommit, staleness, and stats.
  *   GET  /health       — Health check. Returns {"status":"ok","repos":[...]}
  *   POST /shutdown     — Graceful shutdown.
  */
@@ -189,6 +191,29 @@ export function rejectUnauthorizedRequest(
   return true;
 }
 
+export interface ReindexInFlightTracker {
+  readonly active: number;
+  begin(): () => void;
+}
+
+export function createReindexInFlightTracker(): ReindexInFlightTracker {
+  let active = 0;
+  return {
+    get active() {
+      return active;
+    },
+    begin() {
+      active++;
+      let ended = false;
+      return () => {
+        if (ended) return;
+        ended = true;
+        active--;
+      };
+    },
+  };
+}
+
 export function reindexErrorStatus(error: string): number {
   if (/already running/i.test(error)) return 409;
   if (/unknown repo|no repository found|repository .*not found/i.test(error)) return 404;
@@ -200,6 +225,7 @@ export async function reindexRepository(
   backend: LocalBackend,
   body: string,
   refreshEnabled: boolean,
+  tracker: ReindexInFlightTracker = createReindexInFlightTracker(),
 ): Promise<{ statusCode: number; payload: Record<string, unknown> }> {
   if (!refreshEnabled) {
     return {
@@ -234,7 +260,13 @@ export async function reindexRepository(
     return { statusCode: 404, payload: { error: `Unknown repository: ${args.repo}` } };
   }
 
-  const result = await backend.callTool(MCP_REFRESH_TOOL, { repo: args.repo });
+  const endRefresh = tracker.begin();
+  let result: any;
+  try {
+    result = await backend.callTool(MCP_REFRESH_TOOL, { repo: args.repo });
+  } finally {
+    endRefresh();
+  }
   if (result && typeof result === 'object' && typeof result.error === 'string') {
     return { statusCode: reindexErrorStatus(result.error), payload: { error: result.error } };
   }
@@ -250,6 +282,152 @@ export async function reindexRepository(
       stats: result.stats,
     },
   };
+}
+
+class ReindexBodyReadError extends Error {
+  constructor(
+    readonly statusCode: 408 | 413,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+function readBoundedBody(
+  req: http.IncomingMessage,
+  bodyTimeoutMs = 10_000,
+  maxBodyBytes = 65_536,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let size = 0;
+    const chunks: Buffer[] = [];
+    const cleanup = () => {
+      clearTimeout(timer);
+      req.removeListener('data', onData);
+      req.removeListener('end', onEnd);
+      req.removeListener('error', onError);
+      req.removeListener('aborted', onAborted);
+    };
+    const fail = (error: Error, destroy = false) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (destroy && !req.destroyed) req.destroy();
+      reject(error);
+    };
+    const onData = (chunk: Buffer | string) => {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      size += buffer.length;
+      if (size > maxBodyBytes) {
+        fail(new ReindexBodyReadError(413, 'Request body exceeds the allowed size.'), true);
+        return;
+      }
+      chunks.push(buffer);
+    };
+    const onEnd = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(Buffer.concat(chunks).toString('utf8'));
+    };
+    const onError = (error: Error) => fail(error);
+    const onAborted = () => fail(new Error('Request body was interrupted.'));
+    const timer = setTimeout(
+      () => fail(new ReindexBodyReadError(408, 'Timed out while reading request body.'), true),
+      bodyTimeoutMs,
+    );
+
+    const contentLength = Number(req.headers['content-length']);
+    if (Number.isFinite(contentLength) && contentLength > maxBodyBytes) {
+      fail(new ReindexBodyReadError(413, 'Request body exceeds the allowed size.'), true);
+      return;
+    }
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.on('error', onError);
+    req.on('aborted', onAborted);
+  });
+}
+
+type ReindexRequestResponse = Pick<http.ServerResponse, 'setHeader' | 'writeHead' | 'end'>;
+
+interface ReindexRequestDeps {
+  backend: LocalBackend;
+  authToken?: string;
+  refreshEnabled: boolean | (() => boolean);
+  tracker: ReindexInFlightTracker;
+  bodyTimeoutMs?: number;
+  maxBodyBytes?: number;
+}
+
+function sendReindexJson(
+  res: ReindexRequestResponse,
+  statusCode: number,
+  payload: Record<string, unknown>,
+): void {
+  res.setHeader('Content-Type', 'application/json');
+  res.writeHead(statusCode);
+  res.end(JSON.stringify(payload));
+}
+
+export async function handleReindexRequest(
+  req: http.IncomingMessage,
+  res: ReindexRequestResponse,
+  deps: ReindexRequestDeps,
+): Promise<void> {
+  const headers = req.headers as NodeJS.Dict<string | string[]>;
+  if (Object.hasOwn(headers, 'origin') || Object.hasOwn(headers, 'Origin')) {
+    sendReindexJson(res, 403, { error: 'Browser requests are not allowed for /reindex.' });
+    return;
+  }
+  if (!deps.authToken) {
+    sendReindexJson(res, 403, {
+      error:
+        '/reindex requires an auth token. Configure GITNEXUS_AUTH_TOKEN in the environment, .env.local, or .env.',
+    });
+    return;
+  }
+  if (rejectUnauthorizedRequest(req.headers.authorization, deps.authToken, res)) return;
+  let refreshEnabled: boolean;
+  try {
+    refreshEnabled =
+      typeof deps.refreshEnabled === 'function' ? deps.refreshEnabled() : deps.refreshEnabled;
+  } catch (error) {
+    sendReindexJson(res, 500, {
+      error: error instanceof Error ? error.message : 'Unable to resolve reindex opt-in setting.',
+    });
+    return;
+  }
+  if (!refreshEnabled) {
+    sendReindexJson(res, 403, {
+      error: 'Reindex is disabled. Set GITNEXUS_MCP_ENABLE_REFRESH=1 to enable it.',
+    });
+    return;
+  }
+
+  let body: string;
+  try {
+    body = await readBoundedBody(req, deps.bodyTimeoutMs, deps.maxBodyBytes);
+  } catch (error) {
+    if (error instanceof ReindexBodyReadError) {
+      sendReindexJson(res, error.statusCode, { error: error.message });
+      return;
+    }
+    sendReindexJson(res, 400, {
+      error: error instanceof Error ? error.message : 'Unable to read request body.',
+    });
+    return;
+  }
+
+  try {
+    const result = await reindexRepository(deps.backend, body, refreshEnabled, deps.tracker);
+    sendReindexJson(res, result.statusCode, result.payload);
+  } catch (error) {
+    sendReindexJson(res, 500, {
+      error: error instanceof Error ? error.message : 'Index refresh failed.',
+    });
+  }
 }
 
 // ─── Text Formatters ──────────────────────────────────────────────────
@@ -931,13 +1109,13 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
   );
 
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
-  let activeReindexRequests = 0;
+  const reindexTracker = createReindexInFlightTracker();
 
   function resetIdleTimer() {
     if (idleTimeoutSec <= 0) return;
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(async () => {
-      if (activeReindexRequests > 0) {
+      if (reindexTracker.active > 0) {
         resetIdleTimer();
         return;
       }
@@ -956,6 +1134,20 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
   const shutdownToken = crypto.randomBytes(24).toString('hex');
 
   const server = http.createServer(async (req, res) => {
+    if (req.method === 'POST' && req.url === '/reindex') {
+      try {
+        await handleReindexRequest(req, res, {
+          backend,
+          authToken,
+          refreshEnabled: resolveMcpRefreshMode,
+          tracker: reindexTracker,
+        });
+      } finally {
+        resetIdleTimer();
+      }
+      return;
+    }
+
     if (rejectUnauthorizedRequest(req.headers.authorization, authToken, res)) return;
 
     resetIdleTimer();
@@ -986,24 +1178,6 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
           process.exit(0);
         }, 100);
         return;
-      }
-
-      if (req.method === 'POST' && req.url === '/reindex') {
-        activeReindexRequests++;
-        try {
-          const result = await reindexRepository(
-            backend,
-            await readBody(req),
-            resolveMcpRefreshMode(),
-          );
-          res.setHeader('Content-Type', 'application/json');
-          res.writeHead(result.statusCode);
-          res.end(JSON.stringify(result.payload));
-          return;
-        } finally {
-          activeReindexRequests--;
-          resetIdleTimer();
-        }
       }
 
       // Tool calls: POST /tool/:name
