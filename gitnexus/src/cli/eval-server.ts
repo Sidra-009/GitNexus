@@ -357,6 +357,7 @@ interface ReindexRequestDeps {
   authToken?: string;
   refreshEnabled: boolean | (() => boolean);
   tracker: ReindexInFlightTracker;
+  onAuthorized?: () => void;
   bodyTimeoutMs?: number;
   maxBodyBytes?: number;
 }
@@ -389,6 +390,7 @@ export async function handleReindexRequest(
     return;
   }
   if (rejectUnauthorizedRequest(req.headers.authorization, deps.authToken, res)) return;
+  deps.onAuthorized?.();
   let refreshEnabled: boolean;
   try {
     refreshEnabled =
@@ -1141,6 +1143,7 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
           authToken,
           refreshEnabled: resolveMcpRefreshMode,
           tracker: reindexTracker,
+          onAuthorized: resetIdleTimer,
         });
       } finally {
         resetIdleTimer();

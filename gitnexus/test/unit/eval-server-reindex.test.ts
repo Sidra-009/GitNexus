@@ -164,7 +164,8 @@ describe('eval-server POST /reindex', () => {
     async (origin) => {
       const { stream, req } = requestMock({ origin });
       const response = responseMock();
-      const deps = requestDeps();
+      const onAuthorized = vi.fn();
+      const deps = requestDeps({ onAuthorized });
 
       await handleReindexRequest(req, response, deps);
 
@@ -172,6 +173,7 @@ describe('eval-server POST /reindex', () => {
       expect(response.end.mock.calls[0]?.[0]).toContain('Browser requests are not allowed');
       expect(deps.backend.listRepos).not.toHaveBeenCalled();
       expect(deps.backend.callTool).not.toHaveBeenCalled();
+      expect(onAuthorized).not.toHaveBeenCalled();
       expect(stream.listenerCount('data')).toBe(0);
       expect(stream.readableFlowing).toBeNull();
     },
@@ -180,7 +182,8 @@ describe('eval-server POST /reindex', () => {
   it('rejects loopback no-auth mode before reading the body', async () => {
     const { stream, req } = requestMock();
     const response = responseMock();
-    const deps = requestDeps({ authToken: undefined });
+    const onAuthorized = vi.fn();
+    const deps = requestDeps({ authToken: undefined, onAuthorized });
 
     await handleReindexRequest(req, response, deps);
 
@@ -188,6 +191,7 @@ describe('eval-server POST /reindex', () => {
     expect(response.end.mock.calls[0]?.[0]).toContain('GITNEXUS_AUTH_TOKEN');
     expect(deps.backend.listRepos).not.toHaveBeenCalled();
     expect(deps.backend.callTool).not.toHaveBeenCalled();
+    expect(onAuthorized).not.toHaveBeenCalled();
     expect(stream.listenerCount('data')).toBe(0);
     expect(stream.readableFlowing).toBeNull();
   });
@@ -197,20 +201,23 @@ describe('eval-server POST /reindex', () => {
     async (authorization) => {
       const { req } = requestMock(authorization ? { authorization } : {});
       const response = responseMock();
-      const deps = requestDeps();
+      const onAuthorized = vi.fn();
+      const deps = requestDeps({ onAuthorized });
 
       await handleReindexRequest(req, response, deps);
 
       expect(responseStatus(response)).toBe(401);
       expect(response.setHeader).toHaveBeenCalledWith('WWW-Authenticate', 'Bearer');
       expect(deps.backend.callTool).not.toHaveBeenCalled();
+      expect(onAuthorized).not.toHaveBeenCalled();
     },
   );
 
   it('accepts the intended authenticated client without Origin', async () => {
     const { stream, req } = requestMock({ authorization: 'Bearer secret' });
     const response = responseMock();
-    const deps = requestDeps();
+    const onAuthorized = vi.fn(() => expect(stream.listenerCount('data')).toBe(0));
+    const deps = requestDeps({ onAuthorized });
     deps.backend.callTool.mockResolvedValue({
       status: 'refreshed',
       repo: 'GitNexus',
@@ -227,6 +234,7 @@ describe('eval-server POST /reindex', () => {
 
     expect(responseStatus(response)).toBe(200);
     expect(deps.backend.callTool).toHaveBeenCalledWith('refresh_index', { repo: 'GitNexus' });
+    expect(onAuthorized).toHaveBeenCalledTimes(1);
   });
 
   it('resolves the refresh opt-in function per request', async () => {
@@ -274,7 +282,8 @@ describe('eval-server POST /reindex', () => {
   it('checks the opt-in gate before attaching a body reader', async () => {
     const { stream, req } = requestMock({ authorization: 'Bearer secret' });
     const response = responseMock();
-    const deps = requestDeps({ refreshEnabled: false });
+    const onAuthorized = vi.fn(() => expect(stream.listenerCount('data')).toBe(0));
+    const deps = requestDeps({ refreshEnabled: false, onAuthorized });
 
     await handleReindexRequest(req, response, deps);
 
@@ -284,12 +293,14 @@ describe('eval-server POST /reindex', () => {
     expect(stream.listenerCount('data')).toBe(0);
     expect(stream.readableFlowing).toBeNull();
     expect(deps.tracker.active).toBe(0);
+    expect(onAuthorized).toHaveBeenCalledTimes(1);
   });
 
   it('times out an incomplete body, destroys the stream, and leaves the tracker idle', async () => {
     const { stream, req } = requestMock({ authorization: 'Bearer secret' });
     const response = responseMock();
-    const deps = requestDeps({ bodyTimeoutMs: 15 });
+    const onAuthorized = vi.fn(() => expect(stream.listenerCount('data')).toBe(0));
+    const deps = requestDeps({ bodyTimeoutMs: 15, onAuthorized });
 
     const pending = handleReindexRequest(req, response, deps);
     expect(deps.tracker.active).toBe(0);
@@ -298,6 +309,7 @@ describe('eval-server POST /reindex', () => {
     expect(responseStatus(response)).toBe(408);
     expect(stream.destroyed).toBe(true);
     expect(deps.tracker.active).toBe(0);
+    expect(onAuthorized).toHaveBeenCalledTimes(1);
   });
 
   it('rejects an oversized body, destroys the stream, and leaves the tracker idle', async () => {
